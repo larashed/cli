@@ -14,6 +14,7 @@ import (
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/client"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 )
@@ -26,35 +27,16 @@ type statsOptions struct {
 	containers []string
 }
 
-// NewStatsCommand creates a new cobra.Command for `docker stats`
-func NewStatsCommand(dockerCli command.Cli) *cobra.Command {
-	var opts statsOptions
-
-	cmd := &cobra.Command{
-		Use:   "stats [OPTIONS] [CONTAINER...]",
-		Short: "Display a live stream of container(s) resource usage statistics",
-		Args:  cli.RequiresMinArgs(0),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			opts.containers = args
-			return runStats(dockerCli, &opts)
-		},
+func GetStats(dockerCli *client.Client) ([]StatsEntry, error) {
+	var opts = statsOptions{
+		all:        true,
+		noStream:   true,
+		noTrunc:    false,
+		format:     "",
+		containers: nil,
 	}
-
-	flags := cmd.Flags()
-	flags.BoolVarP(&opts.all, "all", "a", false, "Show all containers (default shows just running)")
-	flags.BoolVar(&opts.noStream, "no-stream", false, "Disable streaming stats and only pull the first result")
-	flags.BoolVar(&opts.noTrunc, "no-trunc", false, "Do not truncate output")
-	flags.StringVar(&opts.format, "format", "", "Pretty-print images using a Go template")
-	return cmd
-}
-
-// runStats displays a live stream of resource usage statistics for one or more containers.
-// This shows real-time information on CPU usage, memory usage, and network I/O.
-// nolint: gocyclo
-func runStats(dockerCli command.Cli, opts *statsOptions) error {
 	showAll := len(opts.containers) == 0
 	closeChan := make(chan error)
-
 	ctx := context.Background()
 
 	// monitorContainerEvents watches for container creation and removal (only
@@ -66,7 +48,7 @@ func runStats(dockerCli command.Cli, opts *statsOptions) error {
 			Filters: f,
 		}
 
-		eventq, errq := dockerCli.Client().Events(ctx, options)
+		eventq, errq := dockerCli.Events(ctx, options)
 
 		// Whether we successfully subscribed to eventq or not, we can now
 		// unblock the main goroutine.
@@ -86,9 +68,9 @@ func runStats(dockerCli command.Cli, opts *statsOptions) error {
 	// Get the daemonOSType if not set already
 	if daemonOSType == "" {
 		svctx := context.Background()
-		sv, err := dockerCli.Client().ServerVersion(svctx)
+		sv, err := dockerCli.ServerVersion(svctx)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		daemonOSType = sv.Os
 	}
@@ -103,7 +85,7 @@ func runStats(dockerCli command.Cli, opts *statsOptions) error {
 		options := types.ContainerListOptions{
 			All: opts.all,
 		}
-		cs, err := dockerCli.Client().ContainerList(ctx, options)
+		cs, err := dockerCli.ContainerList(ctx, options)
 		if err != nil {
 			closeChan <- err
 		}
@@ -111,7 +93,7 @@ func runStats(dockerCli command.Cli, opts *statsOptions) error {
 			s := NewStats(container.ID[:12])
 			if cStats.add(s) {
 				waitFirst.Add(1)
-				go collect(ctx, s, dockerCli.Client(), !opts.noStream, waitFirst)
+				go collect(ctx, s, dockerCli, !opts.noStream, waitFirst)
 			}
 		}
 	}
@@ -128,7 +110,7 @@ func runStats(dockerCli command.Cli, opts *statsOptions) error {
 				s := NewStats(e.ID[:12])
 				if cStats.add(s) {
 					waitFirst.Add(1)
-					go collect(ctx, s, dockerCli.Client(), !opts.noStream, waitFirst)
+					go collect(ctx, s, dockerCli, !opts.noStream, waitFirst)
 				}
 			}
 		})
@@ -137,7 +119,7 @@ func runStats(dockerCli command.Cli, opts *statsOptions) error {
 			s := NewStats(e.ID[:12])
 			if cStats.add(s) {
 				waitFirst.Add(1)
-				go collect(ctx, s, dockerCli.Client(), !opts.noStream, waitFirst)
+				go collect(ctx, s, dockerCli, !opts.noStream, waitFirst)
 			}
 		})
 
@@ -166,7 +148,7 @@ func runStats(dockerCli command.Cli, opts *statsOptions) error {
 			s := NewStats(name)
 			if cStats.add(s) {
 				waitFirst.Add(1)
-				go collect(ctx, s, dockerCli.Client(), !opts.noStream, waitFirst)
+				go collect(ctx, s, dockerCli, !opts.noStream, waitFirst)
 			}
 		}
 
@@ -185,64 +167,16 @@ func runStats(dockerCli command.Cli, opts *statsOptions) error {
 		}
 		cStats.mu.Unlock()
 		if len(errs) > 0 {
-			return errors.New(strings.Join(errs, "\n"))
+			return nil, errors.New(strings.Join(errs, "\n"))
 		}
 	}
 
-	format := opts.format
-	if len(format) == 0 {
-		if len(dockerCli.ConfigFile().StatsFormat) > 0 {
-			format = dockerCli.ConfigFile().StatsFormat
-		} else {
-			format = formatter.TableFormatKey
-		}
+	ccstats := []StatsEntry{}
+	cStats.mu.Lock()
+	for _, c := range cStats.cs {
+		ccstats = append(ccstats, c.GetStatistics())
 	}
-	statsCtx := formatter.Context{
-		Output: dockerCli.Out(),
-		Format: NewStatsFormat(format, daemonOSType),
-	}
-	cleanScreen := func() {
-		if !opts.noStream {
-			fmt.Fprint(dockerCli.Out(), "\033[2J")
-			fmt.Fprint(dockerCli.Out(), "\033[H")
-		}
-	}
+	cStats.mu.Unlock()
 
-	var err error
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-	for range ticker.C {
-		cleanScreen()
-		ccstats := []StatsEntry{}
-		cStats.mu.Lock()
-		for _, c := range cStats.cs {
-			ccstats = append(ccstats, c.GetStatistics())
-		}
-		cStats.mu.Unlock()
-		if err = statsFormatWrite(statsCtx, ccstats, daemonOSType, !opts.noTrunc); err != nil {
-			break
-		}
-		if len(cStats.cs) == 0 && !showAll {
-			break
-		}
-		if opts.noStream {
-			break
-		}
-		select {
-		case err, ok := <-closeChan:
-			if ok {
-				if err != nil {
-					// this is suppressing "unexpected EOF" in the cli when the
-					// daemon restarts so it shutdowns cleanly
-					if err == io.ErrUnexpectedEOF {
-						return nil
-					}
-					return err
-				}
-			}
-		default:
-			// just skip
-		}
-	}
-	return err
+	return ccstats, nil
 }
